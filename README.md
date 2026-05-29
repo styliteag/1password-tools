@@ -60,6 +60,44 @@ nicht erreichbar – nur über das SDK.
 die restlichen Schreibvorgänge ab. Dank Idempotenz kann der Lauf danach einfach
 wiederholt werden.
 
+#### Legacy-Items (nicht über das SDK editierbar)
+
+Ältere, im Browser gespeicherte Logins enthalten teils erfasste **Webformular-Felder**
+(z.B. `realm`, `lang`, `saveusername`). Das SDK kann diesen Feldtyp nicht darstellen,
+liefert ihn beim `get` nicht mit, und der Server **lehnt jede Bearbeitung** solcher
+Items ab (`Editing is not supported for unsupported fields`). Diese Items werden
+standardmäßig **sicher übersprungen** – nichts wird beschädigt.
+
+Mit `--strip-legacy-fields` lassen sich diese Felder **vor** dem Edit entfernen:
+
+```bash
+./.venv/bin/python set_autofill.py --account my.1password.eu --vault "My Vault" \
+    --apply --strip-legacy-fields
+```
+
+- **Passkey-sicher**: nutzt gezielte Feld-Löschungen über die `op` CLI
+  (`op item edit … 'label[delete]'`), **nie** ein JSON-Template (Templates würden
+  Passkeys überschreiben).
+- **Verlustbehaftet**: Username/Passwort/TOTP/Notizen bleiben erhalten, die
+  Formular-Vorbelegungen (z.B. `realm`) gehen verloren. Reversibel über den
+  **Versionsverlauf** des Items.
+- Items mit **unbenannten** oder **doppelt benannten** Legacy-Feldern werden nicht
+  automatisch behandelt, sondern zur manuellen Prüfung gemeldet.
+
+> Hinweis: Das `--strip-legacy-fields`-Verfahren mit gezielten `op`-Löschungen ist
+> bislang nicht in einem echten Lauf gegengetestet. Vor breitem Einsatz an **einem**
+> Item verifizieren.
+
+## Tests
+
+```bash
+./.venv/bin/pip install -r requirements-dev.txt
+./.venv/bin/python -m pytest tests/ -q
+```
+
+Die Tests decken die reine Entscheidungslogik ab (welche Items geändert,
+übersprungen oder gestrippt werden) und laufen **ohne** 1Password/Netzwerk.
+
 ## Hinweis zu Secrets
 
 Item-Exporte (`*.json`) sind in `.gitignore` ausgeschlossen, da sie Zugangsdaten

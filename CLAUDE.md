@@ -15,8 +15,27 @@ Ausfüllen"** auf **„Nur genau für diesen Host"** zu setzen.
   auf den Private-Vault** (~98% der privaten Items). DesktopAuth nutzt die Desktop-App-Session und
   erreicht **alle** Vaults inkl. Private.
 - **Round-Trip-Treue bestätigt**: `get→put` erhält TOTP-Secret, Custom-Felder, Concealed-Werte,
-  Sections. Laut SDK-Release-Notes erhält `items.put` auch **Passkeys/Legacy-Felder** (anders als
-  CLI-Templates). Operation ist **idempotent** (zweiter Lauf findet 0).
+  Sections. Operation ist **idempotent** (zweiter Lauf findet 0).
+
+## Legacy-/Webformular-Felder (empirisch verifiziert)
+
+- Alte, im Browser gespeicherte Logins enthalten teils erfasste **Webformular-Felder**
+  (leere `id`, Labels wie `realm`, `lang`, `saveusername`, `confirmpassword`, z.T. ganz leer).
+- Das **SDK stellt diesen Feldtyp nicht dar** → beim `get` fehlen sie (nicht vorab erkennbar),
+  beim `put` lehnt der **Server die gesamte Bearbeitung ab**:
+  `invalid user input: … Editing is not supported for unsupported fields`.
+  → `items.put` erhält Legacy-Felder also **nicht** transparent; betroffene Items sind schlicht
+  nicht SDK-editierbar. (Korrigiert frühere Annahme aus den Release-Notes.)
+- Das Skript fängt genau diesen Server-Fehler ab und zählt ihn als **skip** (kein Datenverlust —
+  der `put` wird atomar abgelehnt, das Item bleibt unverändert).
+- **Workaround `--strip-legacy-fields`**: entfernt die Capture-Felder **vor** dem Edit via
+  gezielter `op item edit … 'label[delete]'`-Löschungen (passkey-sicher, **kein** Template —
+  Templates würden Passkeys überschreiben). Nur Felder mit eindeutigem, nicht-leerem Label;
+  unbenannte/doppelte → manuell. **Verlustbehaftet** (Formular-Vorbelegung wie `realm` geht
+  verloren), reversibel über Item-Versionsverlauf.
+- **Manueller Einzeltest bestätigt** (op-Template-Variante): Junk-Felder entfernt → SDK setzt
+  ExactDomain → Username/Passwort/URL byte-genau erhalten. Die `op`-`[delete]`-Variante im
+  Skript ist noch **nicht** in einem echten Lauf gegengetestet.
 
 ## Voraussetzungen
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import subprocess
 import sys
 
@@ -135,6 +136,58 @@ def is_unsupported_field_error(err: Exception) -> bool:
     return "unsupported field" in msg or "not supported for unsupported" in msg
 
 
+def _op_item_json(account: str, vault_id: str, item_id: str) -> dict | None:
+    """Read an item as JSON via the op CLI (the SDK hides legacy fields)."""
+    res = subprocess.run(
+        ["op", "item", "get", item_id, "--vault", vault_id,
+         "--account", account, "--format", "json"],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0 or not res.stdout.strip():
+        return None
+    try:
+        return json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def plan_legacy_strip(item_json: dict) -> tuple[list[str], str | None]:
+    """Decide which legacy web-form fields can be safely removed via op.
+
+    Returns (deletable_labels, blocker). If blocker is set, the item must NOT
+    be stripped automatically (needs manual handling) and deletable_labels is [].
+
+    Safe-by-construction: we only ever delete fields by their (unique, non-empty)
+    label via targeted `op item edit ... 'label[delete]'`, which leaves every
+    other field — including passkeys — untouched. We refuse (blocker) when a
+    removable field has no label or a duplicate label, because those cannot be
+    targeted unambiguously and the only alternative (a full JSON template) would
+    overwrite passkeys.
+    """
+    removable = [f for f in item_json.get("fields", []) if not f.get("id")]
+    if not removable:
+        return [], "no removable legacy fields found"
+
+    labels = [f.get("label") for f in removable]
+    if any(not lbl for lbl in labels):
+        return [], "has unnamed legacy field(s) — handle manually"
+    if len(set(labels)) != len(labels):
+        return [], "has duplicate legacy field labels — handle manually"
+    return labels, None
+
+
+def strip_legacy_fields(account: str, vault_id: str, item_id: str,
+                        labels: list[str]) -> bool:
+    """Delete the given fields via targeted op assignments (passkey-safe)."""
+    assignments = [f"{lbl}[delete]" for lbl in labels]
+    res = subprocess.run(
+        ["op", "item", "edit", item_id, "--vault", vault_id,
+         "--account", account, *assignments, "--format", "json"],
+        capture_output=True, text=True,
+    )
+    return res.returncode == 0
+
+
 def apply_target(item):
     """Set the target behavior on all websites of the item (new objects)."""
     item.websites = [
@@ -159,7 +212,38 @@ async def list_vaults(account: str) -> None:
         log(f"{v.id:<28}  {v.title}")
 
 
-async def process_vault(client: Client, vault_id: str, title: str, apply: bool) -> dict:
+async def remediate_and_set(client: Client, account: str, vault_id: str,
+                            title: str, item_id: str) -> str:
+    """Strip legacy web-form fields via op, then set the target via the SDK.
+
+    Returns one of: "changed", "skipped", "failed".
+    """
+    item_json = _op_item_json(account, vault_id, item_id)
+    if item_json is None:
+        log(f"  [SKIP] {title!r}: could not read item via op for stripping")
+        return "skipped"
+
+    labels, blocker = plan_legacy_strip(item_json)
+    if blocker:
+        log(f"  [SKIP] {title!r}: {blocker}")
+        return "skipped"
+
+    if not strip_legacy_fields(account, vault_id, item_id, labels):
+        log(f"  [SKIP] {title!r}: op field strip failed")
+        return "skipped"
+
+    log(f"  [STRIP] {title!r}: removed legacy fields {labels}")
+    item = apply_target(await client.items.get(vault_id, item_id))
+    try:
+        await client.items.put(item)
+        return "changed"
+    except Exception as err:  # noqa: BLE001
+        log(f"  [ERROR] {title!r}: still not editable after strip: {err}")
+        return "failed"
+
+
+async def process_vault(client: Client, account: str, vault_id: str, title: str,
+                        apply: bool, strip_legacy: bool) -> dict:
     """Process a single vault. Returns a stats dict."""
     overviews = await client.items.list(vault_id)
     candidates = [o for o in overviews if overview_needs_change(o)]
@@ -171,7 +255,8 @@ async def process_vault(client: Client, vault_id: str, title: str, apply: bool) 
     if not apply:
         log(f"  Dry run: up to {len(candidates)} would be changed. Items carrying "
             "legacy/unsupported fields (passkeys, captured web-form fields) are not "
-            "editable via the SDK and will be skipped on --apply.")
+            "editable via the SDK and will be skipped on --apply"
+            f"{' (unless --strip-legacy-fields removes them first)' if strip_legacy else ''}.")
         return stats
 
     for idx, ov in enumerate(candidates, 1):
@@ -187,8 +272,13 @@ async def process_vault(client: Client, vault_id: str, title: str, apply: bool) 
             stats["changed"] += 1
         except Exception as err:  # noqa: BLE001
             if is_unsupported_field_error(err):
-                stats["skipped"] += 1
-                log(f"  [SKIP] {item.title!r}: legacy/unsupported field (not SDK-editable)")
+                if strip_legacy:
+                    outcome = await remediate_and_set(
+                        client, account, vault_id, item.title, ov.id)
+                    stats[outcome] += 1
+                else:
+                    stats["skipped"] += 1
+                    log(f"  [SKIP] {item.title!r}: legacy/unsupported field (not SDK-editable)")
             else:
                 stats["failed"] += 1
                 log(f"  [ERROR] {item.title!r}: {err}")
@@ -201,7 +291,7 @@ async def process_vault(client: Client, vault_id: str, title: str, apply: bool) 
 
 
 async def run_edit(account: str, vault: str | None, all_vaults: bool,
-                   apply: bool, assume_yes: bool) -> None:
+                   apply: bool, assume_yes: bool, strip_legacy: bool) -> None:
     client = await authenticate(account)
     targets = await resolve_vaults(client, vault, all_vaults)
 
@@ -209,6 +299,10 @@ async def run_edit(account: str, vault: str | None, all_vaults: bool,
     log(f"Mode    : {'WRITE (--apply)' if apply else 'DRY RUN (no writes)'}")
     log(f"Target  : autofill behavior = 'Only fill on this exact host' (ExactDomain)")
     log(f"Vaults  : {', '.join(t for _, t in targets)}")
+    if strip_legacy:
+        log("Strip   : ON — legacy web-form fields are removed before editing.")
+        log("          (username/password/TOTP/notes are kept; captured form-fill")
+        log("          hints like 'realm'/'lang' are lost. Reversible via item history.)")
 
     if apply and not assume_yes:
         if not confirm(f"\nReally write to {len(targets)} vault(s)? [y/N] "):
@@ -217,7 +311,7 @@ async def run_edit(account: str, vault: str | None, all_vaults: bool,
 
     totals = {"changed": 0, "skipped": 0, "failed": 0, "to_change": 0}
     for vault_id, title in targets:
-        s = await process_vault(client, vault_id, title, apply)
+        s = await process_vault(client, account, vault_id, title, apply, strip_legacy)
         for k in totals:
             totals[k] += s.get(k, 0)
 
@@ -248,6 +342,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Actually write changes (otherwise dry run only).")
     p.add_argument("--yes", action="store_true",
                    help="Skip the confirmation prompt on --apply.")
+    p.add_argument("--strip-legacy-fields", action="store_true",
+                   help="For items that the SDK cannot edit (legacy captured "
+                        "web-form fields), remove those fields via the op CLI "
+                        "first, then set the autofill behavior. Passkey-safe: "
+                        "uses targeted field deletes, never a full template. "
+                        "Items with unnamed/duplicate legacy fields are skipped "
+                        "for manual handling. Lossy for form-fill hints.")
     return p.parse_args(argv)
 
 
@@ -269,7 +370,8 @@ def main(argv: list[str]) -> int:
         log("Error: --vault <name|id> or --all-vaults is required.")
         return 2
 
-    asyncio.run(run_edit(args.account, args.vault, args.all_vaults, args.apply, args.yes))
+    asyncio.run(run_edit(args.account, args.vault, args.all_vaults,
+                         args.apply, args.yes, args.strip_legacy_fields))
     return 0
 
 
