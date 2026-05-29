@@ -1,0 +1,18 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# 1Password-Item-Exporte / Debug-Dumps (enthalten ggf. Secrets!)
+*.json
+!.vscode/*.json
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
