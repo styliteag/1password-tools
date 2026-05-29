@@ -109,7 +109,12 @@ def overview_needs_change(overview) -> bool:
 
 
 def risky_reason(item) -> str | None:
-    """Reason why an item is skipped (round-trip fidelity not verified)."""
+    """Reason why an item is skipped (round-trip fidelity not verified).
+
+    Note: some legacy fields (e.g. captured web-form fields, passkeys) are not
+    surfaced by the SDK on get at all, so they cannot be detected here. The
+    server rejects editing such items; that case is handled in process_vault.
+    """
     if any(f.field_type == ItemFieldType.UNSUPPORTED for f in item.fields):
         return "unsupported field (e.g. passkey)"
     if item.files:
@@ -117,6 +122,17 @@ def risky_reason(item) -> str | None:
     if item.document is not None:
         return "document attachment"
     return None
+
+
+def is_unsupported_field_error(err: Exception) -> bool:
+    """True if the server rejected the edit because of hidden unsupported fields.
+
+    These items carry legacy fields (captured web-form inputs, passkeys, ...)
+    that the SDK does not represent. The put is rejected atomically, so the
+    item is left untouched. We treat this as a clean skip, not a failure.
+    """
+    msg = str(err).lower()
+    return "unsupported field" in msg or "not supported for unsupported" in msg
 
 
 def apply_target(item):
@@ -153,8 +169,9 @@ async def process_vault(client: Client, vault_id: str, title: str, apply: bool) 
     log(f"  {len(overviews)} items scanned, {len(candidates)} need changes.")
 
     if not apply:
-        log(f"  Dry run: {len(candidates)} would be changed "
-            "(items with passkey/attachment are skipped automatically on --apply).")
+        log(f"  Dry run: up to {len(candidates)} would be changed. Items carrying "
+            "legacy/unsupported fields (passkeys, captured web-form fields) are not "
+            "editable via the SDK and will be skipped on --apply.")
         return stats
 
     for idx, ov in enumerate(candidates, 1):
@@ -169,8 +186,12 @@ async def process_vault(client: Client, vault_id: str, title: str, apply: bool) 
             await client.items.put(item)
             stats["changed"] += 1
         except Exception as err:  # noqa: BLE001
-            stats["failed"] += 1
-            log(f"  [ERROR] {item.title!r}: {err}")
+            if is_unsupported_field_error(err):
+                stats["skipped"] += 1
+                log(f"  [SKIP] {item.title!r}: legacy/unsupported field (not SDK-editable)")
+            else:
+                stats["failed"] += 1
+                log(f"  [ERROR] {item.title!r}: {err}")
         if idx % 25 == 0:
             log(f"  ... {idx}/{len(candidates)} processed")
 
