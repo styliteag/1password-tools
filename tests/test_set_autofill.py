@@ -5,6 +5,7 @@ decision logic that determines which items are edited, skipped, or stripped.
 """
 from __future__ import annotations
 
+import csv
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -92,46 +93,27 @@ def test_other_error_not_unsupported():
     assert not sa.is_unsupported_field_error(Exception("network timeout"))
 
 
-# --- plan_legacy_strip -----------------------------------------------------
+# --- website_urls ----------------------------------------------------------
 
-def test_strip_plan_all_named_fields():
-    item = {"fields": [
-        {"id": "username", "label": "username"},
-        {"id": "password", "label": "password"},
-        {"id": "", "label": "realm"},
-        {"id": "", "label": "lang"},
-    ]}
-    labels, blocker = sa.plan_legacy_strip(item)
-    assert blocker is None
-    assert labels == ["realm", "lang"]
+def test_website_urls_joins_multiple():
+    item = SimpleNamespace(websites=[website(AutofillBehavior.NEVER),
+                                     website(AutofillBehavior.NEVER)])
+    item.websites[0].url = "https://a.example"
+    item.websites[1].url = "https://b.example"
+    assert sa.website_urls(item) == "https://a.example; https://b.example"
 
 
-def test_strip_plan_blocks_unnamed_field():
-    item = {"fields": [{"id": "", "label": "realm"}, {"id": "", "label": None}]}
-    labels, blocker = sa.plan_legacy_strip(item)
-    assert labels == []
-    assert "unnamed" in blocker
+def test_website_urls_empty():
+    assert sa.website_urls(SimpleNamespace(websites=[])) == ""
 
 
-def test_strip_plan_blocks_duplicate_labels():
-    item = {"fields": [{"id": "", "label": "x"}, {"id": "", "label": "x"}]}
-    labels, blocker = sa.plan_legacy_strip(item)
-    assert labels == []
-    assert "duplicate" in blocker
+# --- write_report ----------------------------------------------------------
 
-
-def test_strip_plan_nothing_to_remove():
-    item = {"fields": [{"id": "username", "label": "username"}]}
-    labels, blocker = sa.plan_legacy_strip(item)
-    assert labels == []
-    assert blocker is not None
-
-
-def test_strip_plan_keeps_totp_removes_empty():
-    item = {"fields": [
-        {"id": "TOTP_x", "label": "one-time password"},
-        {"id": "", "label": "realm"},
-    ]}
-    labels, blocker = sa.plan_legacy_strip(item)
-    assert blocker is None
-    assert labels == ["realm"]
+def test_write_report_csv(tmp_path):
+    path = tmp_path / "skips.csv"
+    skips = [{"vault": "V", "vault_id": "vid", "item_id": "iid",
+              "title": "My, Item", "url": "https://e.example", "reason": "passkey"}]
+    sa.write_report(str(path), "acc", skips)
+    rows = list(csv.reader(path.open(encoding="utf-8")))
+    assert rows[0] == ["account", "vault", "vault_id", "item_id", "title", "url", "reason"]
+    assert rows[1] == ["acc", "V", "vid", "iid", "My, Item", "https://e.example", "passkey"]

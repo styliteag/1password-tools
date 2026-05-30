@@ -7,6 +7,12 @@ has access to ALL vaults including the private one. Requirements:
   1Password -> Settings -> Developer -> "Integrate with other apps" = ON
   The app must be unlocked, otherwise: "Denied authorization for SDK client".
 
+Some old logins carry fields the SDK cannot represent (captured web-form fields,
+"Sign in with Google/Apple" fields, passkeys). The server rejects editing those
+items, so they are skipped atomically (no data loss) and written to a worklist
+(--report). Set their autofill behavior by hand in the desktop app: the GUI edits
+it directly without a template, so it preserves passkeys and needs no field removal.
+
 Examples:
   python set_autofill.py --list-accounts
   python set_autofill.py --account my.1password.eu --list-vaults
@@ -18,7 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
+import csv
 import subprocess
 import sys
 
@@ -36,6 +42,7 @@ INTEGRATION_NAME = "autofill-bulk-edit"
 INTEGRATION_VERSION = "1.0.0"
 TARGET = AutofillBehavior.EXACTDOMAIN
 WEBSITE_CATEGORIES = {ItemCategory.LOGIN, ItemCategory.PASSWORD}
+DEFAULT_REPORT = "skipped_items.csv"
 
 
 def log(msg: str) -> None:
@@ -110,11 +117,11 @@ def overview_needs_change(overview) -> bool:
 
 
 def risky_reason(item) -> str | None:
-    """Reason why an item is skipped (round-trip fidelity not verified).
+    """Reason why an item is skipped before attempting a put (visible markers).
 
-    Note: some legacy fields (e.g. captured web-form fields, passkeys) are not
-    surfaced by the SDK on get at all, so they cannot be detected here. The
-    server rejects editing such items; that case is handled in process_vault.
+    Note: most legacy/unsupported fields (captured web-form fields, passkeys) are
+    NOT surfaced by the SDK on get, so they cannot be detected here. Those surface
+    only when the server rejects the put; that case is handled in process_vault.
     """
     if any(f.field_type == ItemFieldType.UNSUPPORTED for f in item.fields):
         return "unsupported field (e.g. passkey)"
@@ -128,64 +135,19 @@ def risky_reason(item) -> str | None:
 def is_unsupported_field_error(err: Exception) -> bool:
     """True if the server rejected the edit because of hidden unsupported fields.
 
-    These items carry legacy fields (captured web-form inputs, passkeys, ...)
-    that the SDK does not represent. The put is rejected atomically, so the
-    item is left untouched. We treat this as a clean skip, not a failure.
+    Such items carry fields the SDK does not represent (captured web-form inputs,
+    'Sign in with Google/Apple' fields, passkeys). The put is rejected atomically,
+    so the item is left untouched. We treat this as a clean skip, not a failure.
+    The message does not distinguish a passkey from web-form junk, so these items
+    must be handled by hand in the desktop app (see module docstring).
     """
     msg = str(err).lower()
     return "unsupported field" in msg or "not supported for unsupported" in msg
 
 
-def _op_item_json(account: str, vault_id: str, item_id: str) -> dict | None:
-    """Read an item as JSON via the op CLI (the SDK hides legacy fields)."""
-    res = subprocess.run(
-        ["op", "item", "get", item_id, "--vault", vault_id,
-         "--account", account, "--format", "json"],
-        capture_output=True, text=True,
-    )
-    if res.returncode != 0 or not res.stdout.strip():
-        return None
-    try:
-        return json.loads(res.stdout)
-    except json.JSONDecodeError:
-        return None
-
-
-def plan_legacy_strip(item_json: dict) -> tuple[list[str], str | None]:
-    """Decide which legacy web-form fields can be safely removed via op.
-
-    Returns (deletable_labels, blocker). If blocker is set, the item must NOT
-    be stripped automatically (needs manual handling) and deletable_labels is [].
-
-    Safe-by-construction: we only ever delete fields by their (unique, non-empty)
-    label via targeted `op item edit ... 'label[delete]'`, which leaves every
-    other field — including passkeys — untouched. We refuse (blocker) when a
-    removable field has no label or a duplicate label, because those cannot be
-    targeted unambiguously and the only alternative (a full JSON template) would
-    overwrite passkeys.
-    """
-    removable = [f for f in item_json.get("fields", []) if not f.get("id")]
-    if not removable:
-        return [], "no removable legacy fields found"
-
-    labels = [f.get("label") for f in removable]
-    if any(not lbl for lbl in labels):
-        return [], "has unnamed legacy field(s) — handle manually"
-    if len(set(labels)) != len(labels):
-        return [], "has duplicate legacy field labels — handle manually"
-    return labels, None
-
-
-def strip_legacy_fields(account: str, vault_id: str, item_id: str,
-                        labels: list[str]) -> bool:
-    """Delete the given fields via targeted op assignments (passkey-safe)."""
-    assignments = [f"{lbl}[delete]" for lbl in labels]
-    res = subprocess.run(
-        ["op", "item", "edit", item_id, "--vault", vault_id,
-         "--account", account, *assignments, "--format", "json"],
-        capture_output=True, text=True,
-    )
-    return res.returncode == 0
+def website_urls(item) -> str:
+    """Join an item's website URLs for the worklist (helps locate it in the app)."""
+    return "; ".join(w.url for w in item.websites if w.url)
 
 
 def apply_target(item):
@@ -204,6 +166,16 @@ def confirm(prompt: str) -> bool:
         return False
 
 
+def write_report(path: str, account: str, skips: list[dict]) -> None:
+    """Write the worklist of skipped items to a CSV for manual GUI handling."""
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["account", "vault", "vault_id", "item_id", "title", "url", "reason"])
+        for s in skips:
+            writer.writerow([account, s["vault"], s["vault_id"], s["item_id"],
+                             s["title"], s["url"], s["reason"]])
+
+
 async def list_vaults(account: str) -> None:
     client = await authenticate(account)
     vaults = await client.vaults.list()
@@ -212,58 +184,33 @@ async def list_vaults(account: str) -> None:
         log(f"{v.id:<28}  {v.title}")
 
 
-async def remediate_and_set(client: Client, account: str, vault_id: str,
-                            title: str, item_id: str) -> str:
-    """Strip legacy web-form fields via op, then set the target via the SDK.
-
-    Returns one of: "changed", "skipped", "failed".
-    """
-    item_json = _op_item_json(account, vault_id, item_id)
-    if item_json is None:
-        log(f"  [SKIP] {title!r}: could not read item via op for stripping")
-        return "skipped"
-
-    labels, blocker = plan_legacy_strip(item_json)
-    if blocker:
-        log(f"  [SKIP] {title!r}: {blocker}")
-        return "skipped"
-
-    if not strip_legacy_fields(account, vault_id, item_id, labels):
-        log(f"  [SKIP] {title!r}: op field strip failed")
-        return "skipped"
-
-    log(f"  [STRIP] {title!r}: removed legacy fields {labels}")
-    item = apply_target(await client.items.get(vault_id, item_id))
-    try:
-        await client.items.put(item)
-        return "changed"
-    except Exception as err:  # noqa: BLE001
-        log(f"  [ERROR] {title!r}: still not editable after strip: {err}")
-        return "failed"
-
-
-async def process_vault(client: Client, account: str, vault_id: str, title: str,
-                        apply: bool, strip_legacy: bool) -> dict:
-    """Process a single vault. Returns a stats dict."""
+async def process_vault(client: Client, vault_id: str, title: str, apply: bool) -> dict:
+    """Process a single vault. Returns a stats dict (incl. a 'skips' worklist)."""
     overviews = await client.items.list(vault_id)
     candidates = [o for o in overviews if overview_needs_change(o)]
     stats = {"vault": title, "scanned": len(overviews), "to_change": len(candidates),
-             "changed": 0, "skipped": 0, "failed": 0}
+             "changed": 0, "skipped": 0, "failed": 0, "skips": []}
     log(f"\n=== Vault '{title}' ({vault_id}) ===")
     log(f"  {len(overviews)} items scanned, {len(candidates)} need changes.")
 
     if not apply:
         log(f"  Dry run: up to {len(candidates)} would be changed. Items carrying "
             "legacy/unsupported fields (passkeys, captured web-form fields) are not "
-            "editable via the SDK and will be skipped on --apply"
-            f"{' (unless --strip-legacy-fields removes them first)' if strip_legacy else ''}.")
+            "SDK-editable and will be skipped (and worklisted) on --apply.")
         return stats
+
+    def record_skip(item, item_id, reason):
+        stats["skipped"] += 1
+        stats["skips"].append({
+            "vault": title, "vault_id": vault_id, "item_id": item_id,
+            "title": item.title, "url": website_urls(item), "reason": reason,
+        })
 
     for idx, ov in enumerate(candidates, 1):
         item = await client.items.get(vault_id, ov.id)
         reason = risky_reason(item)
         if reason:
-            stats["skipped"] += 1
+            record_skip(item, ov.id, reason)
             log(f"  [SKIP] {item.title!r}: {reason}")
             continue
         apply_target(item)
@@ -272,13 +219,8 @@ async def process_vault(client: Client, account: str, vault_id: str, title: str,
             stats["changed"] += 1
         except Exception as err:  # noqa: BLE001
             if is_unsupported_field_error(err):
-                if strip_legacy:
-                    outcome = await remediate_and_set(
-                        client, account, vault_id, item.title, ov.id)
-                    stats[outcome] += 1
-                else:
-                    stats["skipped"] += 1
-                    log(f"  [SKIP] {item.title!r}: legacy/unsupported field (not SDK-editable)")
+                record_skip(item, ov.id, "not SDK-editable (web-form field or passkey)")
+                log(f"  [SKIP] {item.title!r}: not SDK-editable (handle in app)")
             else:
                 stats["failed"] += 1
                 log(f"  [ERROR] {item.title!r}: {err}")
@@ -291,7 +233,7 @@ async def process_vault(client: Client, account: str, vault_id: str, title: str,
 
 
 async def run_edit(account: str, vault: str | None, all_vaults: bool,
-                   apply: bool, assume_yes: bool, strip_legacy: bool) -> None:
+                   apply: bool, assume_yes: bool, report_path: str) -> None:
     client = await authenticate(account)
     targets = await resolve_vaults(client, vault, all_vaults)
 
@@ -299,10 +241,6 @@ async def run_edit(account: str, vault: str | None, all_vaults: bool,
     log(f"Mode    : {'WRITE (--apply)' if apply else 'DRY RUN (no writes)'}")
     log(f"Target  : autofill behavior = 'Only fill on this exact host' (ExactDomain)")
     log(f"Vaults  : {', '.join(t for _, t in targets)}")
-    if strip_legacy:
-        log("Strip   : ON — legacy web-form fields are removed before editing.")
-        log("          (username/password/TOTP/notes are kept; captured form-fill")
-        log("          hints like 'realm'/'lang' are lost. Reversible via item history.)")
 
     if apply and not assume_yes:
         if not confirm(f"\nReally write to {len(targets)} vault(s)? [y/N] "):
@@ -310,17 +248,24 @@ async def run_edit(account: str, vault: str | None, all_vaults: bool,
             return
 
     totals = {"changed": 0, "skipped": 0, "failed": 0, "to_change": 0}
+    all_skips: list[dict] = []
     for vault_id, title in targets:
-        s = await process_vault(client, account, vault_id, title, apply, strip_legacy)
+        s = await process_vault(client, vault_id, title, apply)
         for k in totals:
             totals[k] += s.get(k, 0)
+        all_skips.extend(s["skips"])
 
     log("\n==================== TOTAL ====================")
     if apply:
         log(f"  Changed: {totals['changed']} | Skipped: {totals['skipped']} | Failed: {totals['failed']}")
+        if all_skips:
+            write_report(report_path, account, all_skips)
+            log(f"\n  {len(all_skips)} item(s) need manual handling -> worklist: {report_path}")
+            log("  Open each in the 1Password desktop app and set 'Only fill on this")
+            log("  exact host' directly (the GUI preserves passkeys; no stripping needed).")
     else:
         log(f"  Would change: {totals['to_change']} items")
-        log("  Run again with --apply to actually write.")
+        log("  Run again with --apply to actually write (and produce the skip worklist).")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -342,13 +287,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Actually write changes (otherwise dry run only).")
     p.add_argument("--yes", action="store_true",
                    help="Skip the confirmation prompt on --apply.")
-    p.add_argument("--strip-legacy-fields", action="store_true",
-                   help="For items that the SDK cannot edit (legacy captured "
-                        "web-form fields), remove those fields via the op CLI "
-                        "first, then set the autofill behavior. Passkey-safe: "
-                        "uses targeted field deletes, never a full template. "
-                        "Items with unnamed/duplicate legacy fields are skipped "
-                        "for manual handling. Lossy for form-fill hints.")
+    p.add_argument("--report", default=DEFAULT_REPORT, metavar="PATH",
+                   help=f"CSV worklist of skipped (not SDK-editable) items, written "
+                        f"on --apply (default: {DEFAULT_REPORT}). Handle these by "
+                        f"hand in the desktop app.")
     return p.parse_args(argv)
 
 
@@ -371,7 +313,7 @@ def main(argv: list[str]) -> int:
         return 2
 
     asyncio.run(run_edit(args.account, args.vault, args.all_vaults,
-                         args.apply, args.yes, args.strip_legacy_fields))
+                         args.apply, args.yes, args.report))
     return 0
 
 

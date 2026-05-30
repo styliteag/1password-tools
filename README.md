@@ -51,42 +51,40 @@ nicht erreichbar – nur über das SDK.
 
 - **Idempotent**: Ein zweiter Lauf findet 0 zu ändernde Einträge.
 - **Verlustfrei**: `get → put` erhält TOTP-Secrets, Custom-Felder, Sections,
-  Concealed-Werte und (laut SDK-Release-Notes) Passkeys/Legacy-Felder.
-- **Sicherheits-Skips**: Einträge mit nicht unterstütztem Feldtyp, Datei- oder
-  Dokument-Anhang werden übersprungen und protokolliert.
+  Concealed-Werte und **Passkeys** (empirisch verifiziert: WebAuthn-Login nach dem
+  Edit weiterhin funktionsfähig).
+- **Sicherheits-Skips**: Einträge mit nicht SDK-darstellbarem Feldtyp, Datei- oder
+  Dokument-Anhang werden übersprungen und in eine Worklist geschrieben (`--report`).
 - **Eine** Auth-Bestätigung pro Lauf (ein Prozess), nicht pro Eintrag.
 
 **Betriebshinweis**: Bei großen Vaults Auto-Lock vorher hochsetzen, sonst brechen
 die restlichen Schreibvorgänge ab. Dank Idempotenz kann der Lauf danach einfach
 wiederholt werden.
 
-#### Legacy-Items (nicht über das SDK editierbar)
+#### Legacy-Items (nicht über das SDK editierbar) → Worklist + manuell
 
 Ältere, im Browser gespeicherte Logins enthalten teils erfasste **Webformular-Felder**
 (z.B. `realm`, `lang`, `saveusername`). Das SDK kann diesen Feldtyp nicht darstellen,
 liefert ihn beim `get` nicht mit, und der Server **lehnt jede Bearbeitung** solcher
 Items ab (`Editing is not supported for unsupported fields`). Diese Items werden
-standardmäßig **sicher übersprungen** – nichts wird beschädigt.
+**sicher übersprungen** (kein Datenverlust) und beim `--apply` in eine CSV-Worklist
+geschrieben (`--report`, Default `skipped_items.csv`).
 
-Mit `--strip-legacy-fields` lassen sich diese Felder **vor** dem Edit entfernen:
+**Warum kein automatischer Fix?** Das einzige Werkzeug, das diese Felder entfernen
+könnte, ist `op item edit --template` – das **zerstört aber Passkeys** (empirisch
+bestätigt). Und Passkeys sind über `op`, SDK **und** 1PUX **nicht erkennbar**, man
+könnte betroffene Items also nicht vorab aussortieren. Vollautomatik ist für diese
+Klasse daher nicht sicher möglich.
+
+**Lösung:** Die Worklist-Items in der **1Password-Desktop-App** öffnen und das
+Verhalten dort direkt setzen. Die App-GUI bearbeitet das Autofill-Verhalten **ohne**
+Template und **ohne** Feldentfernung → Passkeys bleiben erhalten, kein Strippen nötig.
 
 ```bash
-./.venv/bin/python set_autofill.py --account my.1password.eu --vault "My Vault" \
-    --apply --strip-legacy-fields
+# Hauptlauf schreibt zugleich die Worklist
+./.venv/bin/python set_autofill.py --account my.1password.eu --all-vaults \
+    --apply --yes --report skipped.csv
 ```
-
-- **Passkey-sicher**: nutzt gezielte Feld-Löschungen über die `op` CLI
-  (`op item edit … 'label[delete]'`), **nie** ein JSON-Template (Templates würden
-  Passkeys überschreiben).
-- **Verlustbehaftet**: Username/Passwort/TOTP/Notizen bleiben erhalten, die
-  Formular-Vorbelegungen (z.B. `realm`) gehen verloren. Reversibel über den
-  **Versionsverlauf** des Items.
-- Items mit **unbenannten** oder **doppelt benannten** Legacy-Feldern werden nicht
-  automatisch behandelt, sondern zur manuellen Prüfung gemeldet.
-
-> Hinweis: Das `--strip-legacy-fields`-Verfahren mit gezielten `op`-Löschungen ist
-> bislang nicht in einem echten Lauf gegengetestet. Vor breitem Einsatz an **einem**
-> Item verifizieren.
 
 ## Tests
 
@@ -95,8 +93,8 @@ Mit `--strip-legacy-fields` lassen sich diese Felder **vor** dem Edit entfernen:
 ./.venv/bin/python -m pytest tests/ -q
 ```
 
-Die Tests decken die reine Entscheidungslogik ab (welche Items geändert,
-übersprungen oder gestrippt werden) und laufen **ohne** 1Password/Netzwerk.
+Die Tests decken die reine Entscheidungslogik ab (welche Items geändert oder
+übersprungen werden, Worklist-Ausgabe) und laufen **ohne** 1Password/Netzwerk.
 
 ## Hinweis zu Secrets
 

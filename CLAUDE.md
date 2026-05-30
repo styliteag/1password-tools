@@ -17,6 +17,21 @@ Ausfüllen"** auf **„Nur genau für diesen Host"** zu setzen.
 - **Round-Trip-Treue bestätigt**: `get→put` erhält TOTP-Secret, Custom-Felder, Concealed-Werte,
   Sections. Operation ist **idempotent** (zweiter Lauf findet 0).
 
+## Passkeys (empirisch verifiziert, 2026-05-30)
+
+- **SDK `items.put` ERHÄLT Passkeys**: nach `get→set autofill→put` auf einem Passkey-Item
+  funktionierte der WebAuthn-Login weiterhin. → Der **Hauptpfad (SDK) ist passkey-sicher**;
+  reine Passkey-Logins werden normal mitverarbeitet, der Passkey überlebt.
+- **`op item edit --template` ZERSTÖRT Passkeys**: nach einem Template-Edit (gleiche sichtbare
+  Felder) schlug der Login fehl. Bestätigt die Doku-Warnung. → Template-basierter Strip ist
+  **NICHT** passkey-sicher.
+- **Passkeys sind unsichtbar**: weder `op item get --format json` noch die SDK-`Item`-Sicht
+  zeigen einen Passkey oder einen Marker. → Aus CLI/SDK **nicht erkennbar** (1PUX-Export enthält
+  sie; das ist der einzige bekannte Erkennungsweg).
+- Gefahr daher **nur** bei Items, die **gleichzeitig** Webformular-Müll **und** Passkey haben:
+  Der SDK-`put` scheitert (Müll) → Strip-Pfad → Template zerstört den (unsichtbaren) Passkey.
+  Reine Passkey-Items sind unkritisch. Wiederherstellung via Item-Versionsverlauf möglich.
+
 ## Legacy-/Webformular-Felder (empirisch verifiziert)
 
 - Alte, im Browser gespeicherte Logins enthalten teils erfasste **Webformular-Felder**
@@ -28,14 +43,18 @@ Ausfüllen"** auf **„Nur genau für diesen Host"** zu setzen.
   nicht SDK-editierbar. (Korrigiert frühere Annahme aus den Release-Notes.)
 - Das Skript fängt genau diesen Server-Fehler ab und zählt ihn als **skip** (kein Datenverlust —
   der `put` wird atomar abgelehnt, das Item bleibt unverändert).
-- **Workaround `--strip-legacy-fields`**: entfernt die Capture-Felder **vor** dem Edit via
-  gezielter `op item edit … 'label[delete]'`-Löschungen (passkey-sicher, **kein** Template —
-  Templates würden Passkeys überschreiben). Nur Felder mit eindeutigem, nicht-leerem Label;
-  unbenannte/doppelte → manuell. **Verlustbehaftet** (Formular-Vorbelegung wie `realm` geht
-  verloren), reversibel über Item-Versionsverlauf.
-- **Manueller Einzeltest bestätigt** (op-Template-Variante): Junk-Felder entfernt → SDK setzt
-  ExactDomain → Username/Passwort/URL byte-genau erhalten. Die `op`-`[delete]`-Variante im
-  Skript ist noch **nicht** in einem echten Lauf gegengetestet.
+- **Gezieltes Löschen scheitert**: `op item edit … 'label[delete]'` lehnt diese Felder ab
+  (`cannot delete "…" because it is a built-in field`). Targeted-Delete funktioniert **nicht**.
+- **Einziger funktionierender Strip = Template** (`op item edit --template`, leere-`id`-Felder
+  herausgefiltert) — Treue für TOTP/Sections/Custom byte-genau bestätigt, **ABER zerstört Passkeys**.
+- **Entscheidung (2026-05-30): kein automatischer Strip.** Vollautomatik ist für die Klasse
+  „Müll-Feld + Passkey" beweisbar unsicher (Template zerstört Passkey, Passkey nicht erkennbar).
+  Ein früher gebautes `--strip-legacy-fields` wurde **entfernt** (war ohnehin ein No-Op, da
+  `label[delete]` scheitert). Stattdessen: **Worklist** (`--report`, CSV) listet alle
+  übersprungenen Items; der Nutzer setzt sie **manuell in der Desktop-App** (GUI bearbeitet das
+  Autofill-Verhalten direkt, ohne Template → passkey-sicher, kein Strippen nötig).
+- **UI-Automation als Ausweg verworfen**: 1Password.app ist nicht AppleScript-fähig (sdef -192),
+  Accessibility-Scripting verweigert (-25211).
 
 ## Voraussetzungen
 
