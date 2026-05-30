@@ -121,23 +121,33 @@ def test_write_report_csv(tmp_path):
 
 # --- backup write/read round-trip ------------------------------------------
 
-def test_backup_round_trip(tmp_path):
+def _row(item_id, url, behavior, title="A"):
+    return {"vault": "V", "vault_id": "vid", "item_id": item_id, "title": title,
+            "url": url, "behavior": behavior}
+
+
+def test_backup_append_round_trip(tmp_path):
     path = tmp_path / "backup.csv"
-    rows = [
-        {"vault": "V", "vault_id": "vid", "item_id": "i1", "title": "A",
-         "url": "https://a.example", "behavior": "AnywhereOnWebsite"},
-        {"vault": "V", "vault_id": "vid", "item_id": "i1", "title": "A",
-         "url": "https://a2.example", "behavior": "Never"},
-        {"vault": "V", "vault_id": "vid", "item_id": "i2", "title": "B",
-         "url": "https://b.example", "behavior": "AnywhereOnWebsite"},
-    ]
-    sa.write_backup(str(path), "acc", rows)
+    sa.append_backup(str(path), "acc", [_row("i1", "https://a.example", "AnywhereOnWebsite"),
+                                        _row("i1", "https://a2.example", "Never")])
     parsed = sa.read_backup(str(path))
-    assert set(parsed) == {("vid", "i1"), ("vid", "i2")}
     assert parsed[("vid", "i1")]["urls"] == {
         "https://a.example": "AnywhereOnWebsite",
         "https://a2.example": "Never",
     }
+
+
+def test_backup_append_is_cumulative_with_single_header(tmp_path):
+    # simulates per-item flushes (and a resume): later appends must accumulate,
+    # not overwrite, and only one header row may exist.
+    path = tmp_path / "backup.csv"
+    sa.append_backup(str(path), "acc", [_row("i1", "https://a.example", "AnywhereOnWebsite")])
+    sa.append_backup(str(path), "acc", [_row("i2", "https://b.example", "Never", title="B")])
+    rows = list(csv.reader(path.open(encoding="utf-8")))
+    assert rows[0] == sa.BACKUP_HEADER
+    assert sum(1 for r in rows if r == sa.BACKUP_HEADER) == 1
+    parsed = sa.read_backup(str(path))
+    assert set(parsed) == {("vid", "i1"), ("vid", "i2")}
     assert parsed[("vid", "i2")]["title"] == "B"
 
 

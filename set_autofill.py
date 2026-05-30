@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import os
 import subprocess
 import sys
 
@@ -177,15 +178,24 @@ def write_report(path: str, account: str, skips: list[dict]) -> None:
                              s["title"], s["url"], s["reason"]])
 
 
-def write_backup(path: str, account: str, rows: list[dict]) -> None:
-    """Write the pre-change autofill behavior of every changed website (one row
-    per website) so --revert can restore the exact prior state."""
-    with open(path, "w", newline="", encoding="utf-8") as fh:
+BACKUP_HEADER = ["account", "vault", "vault_id", "item_id", "title", "url", "behavior"]
+
+
+def append_backup(path: str, account: str, rows: list[dict]) -> None:
+    """Append the pre-change behavior of just-changed websites (one row each),
+    flushed immediately so an interrupted run stays fully revertible. Appends
+    (never truncates) so resuming after an interruption accumulates; use a fresh
+    --backup filename per campaign. The header is written only when the file is new."""
+    new = not os.path.exists(path) or os.path.getsize(path) == 0
+    with open(path, "a", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["account", "vault", "vault_id", "item_id", "title", "url", "behavior"])
+        if new:
+            writer.writerow(BACKUP_HEADER)
         for r in rows:
             writer.writerow([account, r["vault"], r["vault_id"], r["item_id"],
                              r["title"], r["url"], r["behavior"]])
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 async def list_vaults(account: str) -> None:
@@ -196,12 +206,17 @@ async def list_vaults(account: str) -> None:
         log(f"{v.id:<28}  {v.title}")
 
 
-async def process_vault(client: Client, vault_id: str, title: str, apply: bool) -> dict:
-    """Process a single vault. Returns a stats dict (incl. a 'skips' worklist)."""
+async def process_vault(client: Client, account: str, vault_id: str, title: str,
+                        apply: bool, backup_path: str) -> dict:
+    """Process a single vault. Returns a stats dict (incl. a 'skips' worklist).
+
+    Each successful change is appended to the backup CSV immediately, so an
+    interruption (e.g. auto-lock mid-vault) still leaves every applied change
+    revertible."""
     overviews = await client.items.list(vault_id)
     candidates = [o for o in overviews if overview_needs_change(o)]
     stats = {"vault": title, "scanned": len(overviews), "to_change": len(candidates),
-             "changed": 0, "skipped": 0, "failed": 0, "skips": [], "backup": []}
+             "changed": 0, "skipped": 0, "failed": 0, "skips": []}
     log(f"\n=== Vault '{title}' ({vault_id}) ===")
     log(f"  {len(overviews)} items scanned, {len(candidates)} need changes.")
 
@@ -234,7 +249,7 @@ async def process_vault(client: Client, vault_id: str, title: str, apply: bool) 
         try:
             await client.items.put(item)
             stats["changed"] += 1
-            stats["backup"].extend(before)
+            append_backup(backup_path, account, before)  # flush per item
         except Exception as err:  # noqa: BLE001
             if is_unsupported_field_error(err):
                 record_skip(item, ov.id, "not SDK-editable (web-form field or passkey)")
@@ -270,11 +285,11 @@ async def run_edit(account: str, vault: str | None, all_vaults: bool,
 
     totals = {"changed": 0, "skipped": 0, "failed": 0, "to_change": 0}
     all_skips: list[dict] = []
-    all_backup: list[dict] = []
     vault_errors: list[tuple[str, str]] = []
     for vault_id, title in targets:
         try:
-            s = await process_vault(client, vault_id, title, apply)
+            # backup is appended per item INSIDE process_vault (interrupt-safe)
+            s = await process_vault(client, account, vault_id, title, apply, backup_path)
         except Exception as err:  # noqa: BLE001 - one bad vault must not abort the run
             vault_errors.append((title, str(err)))
             log(f"\n=== Vault '{title}' ({vault_id}) ===")
@@ -283,16 +298,12 @@ async def run_edit(account: str, vault: str | None, all_vaults: bool,
         for k in totals:
             totals[k] += s.get(k, 0)
         all_skips.extend(s["skips"])
-        all_backup.extend(s["backup"])
-        # persist the backup incrementally so an interrupted run is still revertible
-        if apply and all_backup:
-            write_backup(backup_path, account, all_backup)
 
     log("\n==================== TOTAL ====================")
     if apply:
         log(f"  Changed: {totals['changed']} | Skipped: {totals['skipped']} | Failed: {totals['failed']}")
-        if all_backup:
-            log(f"  Backup of {len(all_backup)} changed website(s) -> {backup_path}")
+        if totals["changed"]:
+            log(f"  Prior state backed up -> {backup_path}")
             log(f"  Undo everything: ./set_autofill.py --account {account} --revert {backup_path}")
         if all_skips:
             write_report(report_path, account, all_skips)
