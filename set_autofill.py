@@ -249,8 +249,15 @@ async def run_edit(account: str, vault: str | None, all_vaults: bool,
 
     totals = {"changed": 0, "skipped": 0, "failed": 0, "to_change": 0}
     all_skips: list[dict] = []
+    vault_errors: list[tuple[str, str]] = []
     for vault_id, title in targets:
-        s = await process_vault(client, vault_id, title, apply)
+        try:
+            s = await process_vault(client, vault_id, title, apply)
+        except Exception as err:  # noqa: BLE001 - one bad vault must not abort the run
+            vault_errors.append((title, str(err)))
+            log(f"\n=== Vault '{title}' ({vault_id}) ===")
+            log(f"  [VAULT SKIPPED] {err}")
+            continue
         for k in totals:
             totals[k] += s.get(k, 0)
         all_skips.extend(s["skips"])
@@ -266,6 +273,11 @@ async def run_edit(account: str, vault: str | None, all_vaults: bool,
     else:
         log(f"  Would change: {totals['to_change']} items")
         log("  Run again with --apply to actually write (and produce the skip worklist).")
+
+    if vault_errors:
+        log(f"\n  {len(vault_errors)} vault(s) skipped entirely (e.g. no access):")
+        for title, err in vault_errors:
+            log(f"    - {title}: {err}")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
