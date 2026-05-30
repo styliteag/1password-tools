@@ -55,6 +55,10 @@ nicht erreichbar – nur über das SDK.
   Edit weiterhin funktionsfähig).
 - **Sicherheits-Skips**: Einträge mit nicht SDK-darstellbarem Feldtyp, Datei- oder
   Dokument-Anhang werden übersprungen und in eine Worklist geschrieben (`--report`).
+- **Backup & Undo**: Jeder `--apply` schreibt den **vorherigen** Zustand jedes
+  geänderten Items in eine Backup-CSV (`--backup`, Default `autofill_backup.csv`,
+  inkrementell — auch ein abgebrochener Lauf bleibt rücksetzbar). Komplett rückgängig:
+  `--revert autofill_backup.csv` setzt jedes Item exakt auf sein altes Verhalten zurück.
 - **Eine** Auth-Bestätigung pro Lauf (ein Prozess), nicht pro Eintrag.
 
 **Betriebshinweis**: Bei großen Vaults Auto-Lock vorher hochsetzen, sonst brechen

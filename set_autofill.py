@@ -43,6 +43,7 @@ INTEGRATION_VERSION = "1.0.0"
 TARGET = AutofillBehavior.EXACTDOMAIN
 WEBSITE_CATEGORIES = {ItemCategory.LOGIN, ItemCategory.PASSWORD}
 DEFAULT_REPORT = "skipped_items.csv"
+DEFAULT_BACKUP = "autofill_backup.csv"
 
 
 def log(msg: str) -> None:
@@ -176,6 +177,17 @@ def write_report(path: str, account: str, skips: list[dict]) -> None:
                              s["title"], s["url"], s["reason"]])
 
 
+def write_backup(path: str, account: str, rows: list[dict]) -> None:
+    """Write the pre-change autofill behavior of every changed website (one row
+    per website) so --revert can restore the exact prior state."""
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["account", "vault", "vault_id", "item_id", "title", "url", "behavior"])
+        for r in rows:
+            writer.writerow([account, r["vault"], r["vault_id"], r["item_id"],
+                             r["title"], r["url"], r["behavior"]])
+
+
 async def list_vaults(account: str) -> None:
     client = await authenticate(account)
     vaults = await client.vaults.list()
@@ -189,7 +201,7 @@ async def process_vault(client: Client, vault_id: str, title: str, apply: bool) 
     overviews = await client.items.list(vault_id)
     candidates = [o for o in overviews if overview_needs_change(o)]
     stats = {"vault": title, "scanned": len(overviews), "to_change": len(candidates),
-             "changed": 0, "skipped": 0, "failed": 0, "skips": []}
+             "changed": 0, "skipped": 0, "failed": 0, "skips": [], "backup": []}
     log(f"\n=== Vault '{title}' ({vault_id}) ===")
     log(f"  {len(overviews)} items scanned, {len(candidates)} need changes.")
 
@@ -213,10 +225,16 @@ async def process_vault(client: Client, vault_id: str, title: str, apply: bool) 
             record_skip(item, ov.id, reason)
             log(f"  [SKIP] {item.title!r}: {reason}")
             continue
+        # snapshot the original behavior of every website BEFORE changing it,
+        # so --revert can restore each item to exactly its prior state.
+        before = [{"vault": title, "vault_id": vault_id, "item_id": ov.id,
+                   "title": item.title, "url": w.url,
+                   "behavior": w.autofill_behavior.value} for w in item.websites]
         apply_target(item)
         try:
             await client.items.put(item)
             stats["changed"] += 1
+            stats["backup"].extend(before)
         except Exception as err:  # noqa: BLE001
             if is_unsupported_field_error(err):
                 record_skip(item, ov.id, "not SDK-editable (web-form field or passkey)")
@@ -233,7 +251,8 @@ async def process_vault(client: Client, vault_id: str, title: str, apply: bool) 
 
 
 async def run_edit(account: str, vault: str | None, all_vaults: bool,
-                   apply: bool, assume_yes: bool, report_path: str) -> None:
+                   apply: bool, assume_yes: bool, report_path: str,
+                   backup_path: str) -> None:
     client = await authenticate(account)
     targets = await resolve_vaults(client, vault, all_vaults)
 
@@ -241,6 +260,8 @@ async def run_edit(account: str, vault: str | None, all_vaults: bool,
     log(f"Mode    : {'WRITE (--apply)' if apply else 'DRY RUN (no writes)'}")
     log(f"Target  : autofill behavior = 'Only fill on this exact host' (ExactDomain)")
     log(f"Vaults  : {', '.join(t for _, t in targets)}")
+    if apply:
+        log(f"Backup  : prior state of each changed item -> {backup_path} (undo: --revert)")
 
     if apply and not assume_yes:
         if not confirm(f"\nReally write to {len(targets)} vault(s)? [y/N] "):
@@ -249,6 +270,7 @@ async def run_edit(account: str, vault: str | None, all_vaults: bool,
 
     totals = {"changed": 0, "skipped": 0, "failed": 0, "to_change": 0}
     all_skips: list[dict] = []
+    all_backup: list[dict] = []
     vault_errors: list[tuple[str, str]] = []
     for vault_id, title in targets:
         try:
@@ -261,10 +283,17 @@ async def run_edit(account: str, vault: str | None, all_vaults: bool,
         for k in totals:
             totals[k] += s.get(k, 0)
         all_skips.extend(s["skips"])
+        all_backup.extend(s["backup"])
+        # persist the backup incrementally so an interrupted run is still revertible
+        if apply and all_backup:
+            write_backup(backup_path, account, all_backup)
 
     log("\n==================== TOTAL ====================")
     if apply:
         log(f"  Changed: {totals['changed']} | Skipped: {totals['skipped']} | Failed: {totals['failed']}")
+        if all_backup:
+            log(f"  Backup of {len(all_backup)} changed website(s) -> {backup_path}")
+            log(f"  Undo everything: ./set_autofill.py --account {account} --revert {backup_path}")
         if all_skips:
             write_report(report_path, account, all_skips)
             log(f"\n  {len(all_skips)} item(s) need manual handling -> worklist: {report_path}")
@@ -278,6 +307,45 @@ async def run_edit(account: str, vault: str | None, all_vaults: bool,
         log(f"\n  {len(vault_errors)} vault(s) skipped entirely (e.g. no access):")
         for title, err in vault_errors:
             log(f"    - {title}: {err}")
+
+
+def read_backup(path: str) -> dict:
+    """Read a backup CSV into {(vault_id, item_id): {url: behavior}}."""
+    items: dict = {}
+    with open(path, newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            key = (row["vault_id"], row["item_id"])
+            items.setdefault(key, {"title": row["title"], "urls": {}})
+            items[key]["urls"][row["url"]] = row["behavior"]
+    return items
+
+
+async def run_revert(account: str, backup_path: str, assume_yes: bool) -> None:
+    """Restore the autofill behavior recorded in a backup CSV (undo of --apply)."""
+    items = read_backup(backup_path)
+    log(f"Account : {account}")
+    log(f"Revert  : restore prior autofill behavior from {backup_path}")
+    log(f"Items   : {len(items)}")
+    if not assume_yes and not confirm(f"\nRestore {len(items)} item(s) to their backed-up state? [y/N] "):
+        log("Aborted.")
+        return
+
+    client = await authenticate(account)
+    restored = failed = 0
+    for (vault_id, item_id), info in items.items():
+        try:
+            item = await client.items.get(vault_id, item_id)
+            item.websites = [
+                Website(url=w.url, label=w.label,
+                        autofill_behavior=AutofillBehavior(info["urls"].get(w.url, w.autofill_behavior.value)))
+                for w in item.websites
+            ]
+            await client.items.put(item)
+            restored += 1
+        except Exception as err:  # noqa: BLE001
+            failed += 1
+            log(f"  [ERROR] {info['title']!r} ({item_id}): {err}")
+    log(f"\nRestored: {restored} | Failed: {failed}")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -303,6 +371,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help=f"CSV worklist of skipped (not SDK-editable) items, written "
                         f"on --apply (default: {DEFAULT_REPORT}). Handle these by "
                         f"hand in the desktop app.")
+    p.add_argument("--backup", default=DEFAULT_BACKUP, metavar="PATH",
+                   help=f"CSV recording each changed item's prior autofill behavior, "
+                        f"written on --apply (default: {DEFAULT_BACKUP}). Use with "
+                        f"--revert to undo.")
+    p.add_argument("--revert", metavar="BACKUP_CSV",
+                   help="Restore autofill behavior from a backup CSV (undo a prior "
+                        "--apply) and exit. Requires --account.")
     return p.parse_args(argv)
 
 
@@ -320,12 +395,16 @@ def main(argv: list[str]) -> int:
         asyncio.run(list_vaults(args.account))
         return 0
 
+    if args.revert:
+        asyncio.run(run_revert(args.account, args.revert, args.yes))
+        return 0
+
     if not args.vault and not args.all_vaults:
         log("Error: --vault <name|id> or --all-vaults is required.")
         return 2
 
     asyncio.run(run_edit(args.account, args.vault, args.all_vaults,
-                         args.apply, args.yes, args.report))
+                         args.apply, args.yes, args.report, args.backup))
     return 0
 
 

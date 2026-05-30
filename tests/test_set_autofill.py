@@ -117,3 +117,32 @@ def test_write_report_csv(tmp_path):
     rows = list(csv.reader(path.open(encoding="utf-8")))
     assert rows[0] == ["account", "vault", "vault_id", "item_id", "title", "url", "reason"]
     assert rows[1] == ["acc", "V", "vid", "iid", "My, Item", "https://e.example", "passkey"]
+
+
+# --- backup write/read round-trip ------------------------------------------
+
+def test_backup_round_trip(tmp_path):
+    path = tmp_path / "backup.csv"
+    rows = [
+        {"vault": "V", "vault_id": "vid", "item_id": "i1", "title": "A",
+         "url": "https://a.example", "behavior": "AnywhereOnWebsite"},
+        {"vault": "V", "vault_id": "vid", "item_id": "i1", "title": "A",
+         "url": "https://a2.example", "behavior": "Never"},
+        {"vault": "V", "vault_id": "vid", "item_id": "i2", "title": "B",
+         "url": "https://b.example", "behavior": "AnywhereOnWebsite"},
+    ]
+    sa.write_backup(str(path), "acc", rows)
+    parsed = sa.read_backup(str(path))
+    assert set(parsed) == {("vid", "i1"), ("vid", "i2")}
+    assert parsed[("vid", "i1")]["urls"] == {
+        "https://a.example": "AnywhereOnWebsite",
+        "https://a2.example": "Never",
+    }
+    assert parsed[("vid", "i2")]["title"] == "B"
+
+
+def test_backup_behaviors_are_valid_enum_values():
+    # every behavior we record must round-trip back into the enum on revert
+    from onepassword import AutofillBehavior
+    for b in AutofillBehavior:
+        assert AutofillBehavior(b.value) is b

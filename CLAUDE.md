@@ -16,6 +16,11 @@ Ausfüllen"** auf **„Nur genau für diesen Host"** zu setzen.
   erreicht **alle** Vaults inkl. Private.
 - **Round-Trip-Treue bestätigt**: `get→put` erhält TOTP-Secret, Custom-Felder, Concealed-Werte,
   Sections. Operation ist **idempotent** (zweiter Lauf findet 0).
+- **Backup/Undo**: `--apply` schreibt den Vorzustand jedes geänderten Items in eine Backup-CSV
+  (`--backup`, inkrementell). `--revert <csv>` setzt exakt zurück (live verifiziert: ExactDomain →
+  AnywhereOnWebsite). Geänderter Umfang ist nur `autofill_behavior` — minimaler Blast-Radius.
+- **Robustheit**: Ein Vault ohne Zugriff (`you do not have the right permissions`) wird als
+  `[VAULT SKIPPED]` geloggt und der Lauf läuft weiter (kein Abbruch bei `--all-vaults`).
 
 ## Passkeys (empirisch verifiziert, 2026-05-30)
 
